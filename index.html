@@ -519,6 +519,7 @@ function load(f, done){
     if (f === 'daily') DECKS.daily.s = o;
     else if (f === 'decks'){ for (var k in o) DECKS[k] = o[k]; }
     else BOOKS[f.slice(5)] = o;
+    auAdd(f, o);
     LZ[f] = 1; q.forEach(function(cb){ cb(true); });
   }, function(){ LZ[f] = 0; q.forEach(function(cb){ cb(false); }); });
 }
@@ -646,7 +647,7 @@ function showCard(keep){   // keep=true：还没打分的当前卡片继续显�
   $('grades').classList.add('wait');
   var now = Date.now();
   [1,3,4,5].forEach(function(q){ $('iv'+q).textContent = fmtIvl(schedule(D.c[cur], q, now), now); });
-  if (dir === 'en' && S().autoSay) say(en);
+  if (dir === 'en' && S().autoSay) say(en); else auPre(en);
 }
 function S(){ return G.set; }
 function flip(){
@@ -682,8 +683,47 @@ function pickVoice(acc){
   var pref = /(Samantha|Ava|Allison|Daniel|Serena|Kate|Google|Natural|Enhanced|Premium)/i;
   return list.filter(function(v){ return pref.test(v.name); })[0] || list[0] || null;
 }
+/* 网站版：每句都有预先生成的真人感录音（audio/：美式 Aria 全部句子；audio/uk/：英式 Sonia，只有日常口语和职场英语），所有朗读都从 say() 走；
+   录音放不出来（没生成、断网、太慢）时，才用下面 ttsSay() 的浏览器自带语音。单文件版没有录音，直接用浏览器语音。 */
+var AIX = null, AU = {}, AEL = null, APRE = [], sayTok = 0;   // 录音目录 audio/index.json；句子 → 录音路径；播放器；预加载
+var AU_X = ['Nice to meet you.', 'How are you doing today?'];   // 设置面板里试听的两句（audio/x/0、x/1）
+function auAdd(f, o){   // 数据下载好后登记每句的录音路径：daily/12、biz/3、prince/章/句
+  var add = function(t, p){ if (t && !AU[t]) AU[t] = p; };   // 同一句在几处出现：用同一个录音（日常口语优先）
+  if (f === 'daily') o.forEach(function(x, i){ if (x[0]) AU[x[0]] = 'daily/' + i; });
+  else if (f === 'decks'){ for (var k in o) o[k].s.forEach(function(x, i){ add(x[0], k + '/' + i); }); }
+  else { var b = f.slice(5); o.ch.forEach(function(c, ci){ var i = 0; c.p.forEach(function(p){ p.forEach(function(x){ add(x[0], b + '/' + ci + '/' + (i++)); }); }); }); }
+}
+function auUrl(text, acc){   // 选了英式、且这一组有英式录音 → audio/uk/…；否则美式；都没有 → null（用浏览器语音）
+  var p = AIX && AU[text]; if (!p) return null;
+  var g = p.split('/')[0], uk = acc === 'en-GB' && AIX.sets['uk/' + g], st = AIX.sets[g];
+  return uk ? 'audio/uk/' + p + '.mp3?v=' + uk.h : st ? 'audio/' + p + '.mp3?v=' + st.h : null;
+}
+function auPre(text){   // 提前下载下一句的录音，播放时不用等
+  var u = auUrl(text, S().accent); if (!u || APRE.some(function(a){ return a.u === u; })) return;
+  var a = new Audio(); a.preload = 'auto'; a.src = u; a.u = u; APRE.push(a); if (APRE.length > 3) APRE.shift();
+}
 function say(text, acc, onend, rate){
   acc = acc || S().accent; rate = rate || S().rate;
+  stopSay();
+  var u = auUrl(text, acc);
+  if (!u){ ttsSay(text, acc, onend, rate); return; }
+  if (!AEL) AEL = new Audio();   // 只用一个播放器：苹果手机点过一次后才允许连续播放
+  var a = AEL, tok = sayTok, done = false, t0 = Date.now(), guard;
+  var end = function(fail){
+    if (done || tok !== sayTok) return; done = true; clearTimeout(guard);
+    if (fail){ a.pause(); ttsSay(text, acc, onend, rate); } else if (onend) onend(Date.now() - t0);
+  };
+  a.onended = function(){ end(false); };
+  a.onerror = function(){ end(true); };
+  a.onplaying = function(){   // 开始出声：从这里计时（跟读的停顿按朗读时长算），再按时长设一个兜底
+    if (tok !== sayTok) return; t0 = Date.now(); clearTimeout(guard);
+    guard = setTimeout(function(){ end(false); }, (a.duration > 0 ? a.duration * 1000 / rate : 30000) + 2500);
+  };
+  guard = setTimeout(function(){ end(true); }, 15000);   // 15 秒还没出声（网太慢）就改用浏览器语音
+  a.src = u; a.defaultPlaybackRate = rate; a.playbackRate = rate;
+  var pr = a.play(); if (pr && pr.then) pr.then(null, function(){ end(true); });
+}
+function ttsSay(text, acc, onend, rate){
   if (!synth){ toast('这个浏览器不支持朗读'); onend && setTimeout(onend, 1500); return; }
   synth.cancel();
   var u = new SpeechSynthesisUtterance(text), v = pickVoice(acc), done = false, t0 = Date.now();
@@ -694,7 +734,7 @@ function say(text, acc, onend, rate){
   var guard = setTimeout(fin, 2500 + text.split(/\s+/).length * 600 / rate);
   synth.speak(u);
 }
-function stopSay(){ if (synth) synth.cancel(); }
+function stopSay(){ sayTok++; if (AEL) AEL.pause(); if (synth) synth.cancel(); }
 
 /* ---------- 跟读模式：播放 → 停顿让你跟说 → 下一遍/下一句 ---------- */
 var shOn = false, shTimer = null, shToken = 0;
@@ -716,6 +756,7 @@ function shPlay(){
     if (tok !== shToken) return;
     rep++;
     shStatus('🎧 听（第 ' + rep + '/' + S().rep + ' 遍）');
+    auPre(DATA[(D.sh + 1) % N][0]);
     say(DATA[D.sh][0], null, function(dur){
       if (tok !== shToken) return;
       var pause = Math.max(1500, dur * CONFIG.shadowPauseFactor + CONFIG.shadowPauseExtraMs);
@@ -930,6 +971,7 @@ function rdPlay(){
   (function go(){
     if (tok !== R.tok) return;
     var ss = chS(R.b, R.ch);
+    if (ss[R.s + 1]) auPre(ss[R.s + 1][0]);
     say(ss[R.s][0], null, function(){
       if (tok !== R.tok) return;
       R.timer = setTimeout(function(){
@@ -1119,7 +1161,11 @@ loadMain();
 document.body.classList.toggle('rnozh', !S().rdZh);
 D = G; DATA = DECKS.daily.s || []; N = DATA.length;
 bind(); route();
-if (META) setTimeout(function(){ load('daily', function(){}); load('decks', function(){}); }, 50);   // 首页显示出来后，马上在后台下载句子
+if (META) setTimeout(function(){
+  load('daily', function(){}); load('decks', function(){});
+  AU_X.forEach(function(t, i){ AU[t] = 'x/' + i; });
+  getJSON('audio/index.json?t=' + Math.floor(Date.now() / 6e5), function(o){ AIX = o; }, function(){});   // 没有录音目录就一直用浏览器语音
+}, 50);   // 首页显示出来后，马上在后台下载句子
 
 })();
 
